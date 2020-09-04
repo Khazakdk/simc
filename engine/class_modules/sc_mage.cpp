@@ -808,7 +808,6 @@ public:
   void init_base_stats() override;
   void create_buffs() override;
   void create_options() override;
-  void init_assessors() override;
   void init_action_list() override;
   std::string default_potion() const override;
   std::string default_flask() const override;
@@ -1100,8 +1099,6 @@ struct touch_of_the_magi_t : public buff_t
 
     explosion->set_target( player );
     double damage_fraction = p->spec.touch_of_the_magi->effectN( 1 ).percent();
-    // TODO: For some reason the Magi's Brand conduit is always active. Verify whether this is still
-    // the case closer to release, but for now this bug is not implemented.
     // TODO: Higher ranks of this spell use floating point values in the spell data.
     // Verify whether we need a floor operation here to trim those values down to integers,
     // which sometimes happens when Blizzard uses floating point numbers like this.
@@ -1726,17 +1723,34 @@ public:
 
     if ( auto td = p()->target_data[ s->target ] )
     {
-      if ( triggers.radiant_spark && td->dots.radiant_spark->is_ticking() )
+      auto spark_dot = td->dots.radiant_spark;
+      if ( triggers.radiant_spark && spark_dot->is_ticking() )
       {
-        if ( td->debuffs.radiant_spark_vulnerability->check() < td->debuffs.radiant_spark_vulnerability->max_stack() )
+        auto spark_debuff = td->debuffs.radiant_spark_vulnerability;
+        if ( spark_debuff->check() < spark_debuff->max_stack() )
         {
-          td->debuffs.radiant_spark_vulnerability->trigger();
+          spark_debuff->trigger();
         }
         else
         {
-          td->debuffs.radiant_spark_vulnerability->expire();
+          spark_debuff->expire();
           // Prevent new applications of the vulnerability debuff until the DoT finishes ticking.
-          td->debuffs.radiant_spark_vulnerability->cooldown->start( nullptr, td->dots.radiant_spark->remains() );
+          spark_debuff->cooldown->start( nullptr, spark_dot->remains() );
+        }
+      }
+
+      auto totm = debug_cast<buffs::touch_of_the_magi_t*>( td->debuffs.touch_of_the_magi );
+      if ( totm->check() )
+      {
+        totm->accumulate_damage( s );
+
+        if ( p()->talents.arcane_echo->ok() && s->action != p()->action.arcane_echo )
+        {
+          make_event( *sim, 0_ms, [ this, t = s->target ]
+          {
+            p()->action.arcane_echo->set_target( t );
+            p()->action.arcane_echo->execute();
+          } );
         }
       }
     }
@@ -3634,10 +3648,12 @@ struct flurry_t : public frost_mage_spell_t
     bool brain_freeze = p()->buffs.brain_freeze->up();
     p()->state.brain_freeze_active = brain_freeze;
     p()->buffs.brain_freeze->decrement();
-    p()->remaining_winters_chill = 2;
 
     if ( brain_freeze )
+    {
+      p()->remaining_winters_chill = 2;
       p()->procs.brain_freeze_used->occur();
+    }
 
     if ( p()->buffs.cold_front_ready->check() )
     {
@@ -3891,6 +3907,10 @@ struct frozen_orb_t : public frost_mage_spell_t
   {
     frost_mage_spell_t::execute();
 
+    if ( background )
+      return;
+
+    // TODO: Check how Cold Front and Freezing Winds interact
     p()->buffs.freezing_rain->trigger();
     p()->buffs.freezing_winds->trigger();
   }
@@ -4274,43 +4294,19 @@ struct ice_nova_t : public frost_mage_spell_t
 
 struct icy_veins_t : public frost_mage_spell_t
 {
-  bool precombat;
-
   icy_veins_t( util::string_view n, mage_t* p, util::string_view options_str ) :
-    frost_mage_spell_t( n, p, p->find_specialization_spell( "Icy Veins" ) ),
-    precombat()
+    frost_mage_spell_t( n, p, p->find_specialization_spell( "Icy Veins" ) )
   {
     parse_options( options_str );
     harmful = false;
     cooldown->duration *= p->strive_for_perfection_multiplier;
   }
 
-  void init_finished() override
-  {
-    frost_mage_spell_t::init_finished();
-
-    if ( action_list && action_list->name_str == "precombat" )
-      precombat = true;
-  }
-
-  void schedule_execute( action_state_t* s ) override
-  {
-    // Icy Veins buff is applied before the spell is cast, allowing it to
-    // reduce GCD of the action that triggered it.
-    if ( !precombat )
-      p()->buffs.icy_veins->trigger();
-
-    frost_mage_spell_t::schedule_execute( s );
-  }
-
   void execute() override
   {
     frost_mage_spell_t::execute();
 
-    // Precombat actions skip schedule_execute, so the buff needs to be
-    // triggered here for precombat actions.
-    if ( precombat )
-      p()->buffs.icy_veins->trigger();
+    p()->buffs.icy_veins->trigger();
 
     // Frigid Grasp buff doesn't refresh.
     p()->buffs.frigid_grasp->expire();
@@ -5237,6 +5233,12 @@ struct mirrors_of_torment_t : public mage_spell_t
   {
     parse_options( options_str );
     affected_by.ice_floes = true;
+
+    if ( data().ok() )
+    {
+      add_child( p->action.agonizing_backlash );
+      add_child( p->action.tormenting_backlash );
+    }
   }
 
   void impact( action_state_t* s ) override
@@ -6638,45 +6640,6 @@ void mage_t::init_rng()
   // TODO: There's no data about this in game. Keep an eye out in case Blizzard
   // changes this behind the scenes.
   shuffled_rng.time_anomaly = get_shuffled_rng( "time_anomaly", 1, 16 );
-}
-
-void mage_t::init_assessors()
-{
-  player_t::init_assessors();
-
-  if ( spec.touch_of_the_magi->ok() )
-  {
-    auto assessor_fn = [ this ] ( result_amount_type rt, action_state_t* s )
-    {
-      if ( auto td = target_data[ s->target ] )
-      {
-        auto buff = debug_cast<buffs::touch_of_the_magi_t*>( td->debuffs.touch_of_the_magi );
-        if ( buff->check() )
-        {
-          buff->accumulate_damage( s );
-
-          // TODO: Double check what exactly procs Arcane Echo
-          if ( ( bugs || s->result_type == result_amount_type::DMG_DIRECT )
-            && s->result_total > 0.0
-            && s->action != action.arcane_echo
-            && talents.arcane_echo->ok() )
-          {
-            make_event( *sim, 0_ms, [ this, t = s->target ]
-            {
-              action.arcane_echo->set_target( t );
-              action.arcane_echo->execute();
-            } );
-          }
-        }
-      }
-
-      return assessor::CONTINUE;
-    };
-
-    assessor_out_damage.add( assessor::TARGET_DAMAGE - 1, assessor_fn );
-    for ( auto pet : pet_list )
-      pet->assessor_out_damage.add( assessor::TARGET_DAMAGE - 1, assessor_fn );
-  }
 }
 
 void mage_t::init_finished()

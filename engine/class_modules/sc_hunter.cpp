@@ -633,7 +633,6 @@ public:
     timespan_t pet_attack_speed = 2_s;
     timespan_t pet_basic_attack_delay = 0.15_s;
     double memory_of_lucid_dreams_proc_chance = 0.15;
-    bool rolling_master_marksman = false;
   } options;
 
   hunter_t( sim_t* sim, util::string_view name, race_e r = RACE_NONE ) :
@@ -1133,20 +1132,7 @@ struct hunter_ranged_attack_t: public hunter_action_t < ranged_attack_t >
     {
       double amount = s -> result_amount * p() -> talents.master_marksman -> effectN( 1 ).percent();
       if ( amount > 0 )
-      {
-        if ( p() -> options.rolling_master_marksman )
-        {
-          residual_action::trigger( p() -> actions.master_marksman, s -> target, amount );
-          return;
-        }
-
-        // Hack, current in-game behaviour, mostly
-        action_t* a = p() -> actions.master_marksman;
-        unsigned tick_count = as<unsigned>( a -> dot_duration / a -> data().effectN( 1 ).period() );
-        a -> base_td = amount / tick_count;
-        a -> set_target( s -> target );
-        a -> execute();
-      }
+        residual_action::trigger( p() -> actions.master_marksman, s -> target, amount );
     }
   }
 };
@@ -2305,7 +2291,7 @@ auto active( Pets... pets_ ) -> active_pets_t<Pet, sizeof...(Pets)>
     if ( pet && ! pet -> is_sleeping() )
       active_pets[ active_pet_count++ ] = pet;
   }
-  
+
   return { active_pets, active_pet_count };
 }
 
@@ -2982,6 +2968,7 @@ struct arcane_shot_base_t: public hunter_ranged_attack_t
     hunter_ranged_attack_t::execute();
 
     p() -> trigger_lethal_shots();
+    p() -> trigger_calling_the_shots();
   }
 
   double action_multiplier() const override
@@ -3010,8 +2997,6 @@ struct arcane_shot_t: public arcane_shot_base_t
 
     p() -> buffs.precise_shots -> up(); // benefit tracking
     p() -> buffs.precise_shots -> decrement();
-
-    p() -> trigger_calling_the_shots();
   }
 };
 
@@ -3029,6 +3014,13 @@ struct chimaera_shot_base_t: public hunter_ranged_attack_t
       // Beast Mastery focus gain
       if ( p -> specs.beast_mastery_hunter.ok() )
         parse_effect_data( p -> find_spell( 204304 ) -> effectN( 1 ) );
+    }
+
+    void execute() override
+    {
+      hunter_ranged_attack_t::execute();
+
+      p() -> trigger_lethal_shots();
     }
 
     double action_multiplier() const override
@@ -3050,8 +3042,11 @@ struct chimaera_shot_base_t: public hunter_ranged_attack_t
     aoe = 2;
     radius = 5;
 
-    damage[ 0 ] = p -> get_background_action<impact_t>( fmt::format( "{}_frost", n ), p -> find_spell( 171454 ) );
-    damage[ 1 ] = p -> get_background_action<impact_t>( fmt::format( "{}_nature", n ), p -> find_spell( 171457 ) );
+    constexpr std::array<unsigned, 2> bm_spells { { 171454, 171457 } };
+    constexpr std::array<unsigned, 2> mm_spells { { 344121, 344120 } };
+    const auto spells = p -> specialization() == HUNTER_MARKSMANSHIP ? mm_spells : bm_spells;
+    damage[ 0 ] = p -> get_background_action<impact_t>( fmt::format( "{}_frost", n ), p -> find_spell( spells[ 0 ] ) );
+    damage[ 1 ] = p -> get_background_action<impact_t>( fmt::format( "{}_nature", n ), p -> find_spell( spells[ 1 ] ) );
     for ( auto a : damage )
       add_child( a );
 
@@ -3062,9 +3057,7 @@ struct chimaera_shot_base_t: public hunter_ranged_attack_t
   {
     hunter_ranged_attack_t::execute();
 
-    // TODO: Review both for the base spell & Serpenstalker's Trickery
     p() -> trigger_calling_the_shots();
-    p() -> trigger_lethal_shots();
   }
 
   void schedule_travel( action_state_t* s ) override
@@ -3207,35 +3200,6 @@ struct barbed_shot_t: public hunter_ranged_attack_t
 //==============================
 
 // Master Marksman ====================================================================
-
-struct broken_master_marksman_t : public hunter_ranged_attack_t
-{
-  broken_master_marksman_t( hunter_t* p ):
-    hunter_ranged_attack_t( "master_marksman", p, p -> find_spell( 269576 ) )
-  {
-    background = true;
-    callbacks = false;
-
-    attack_power_mod.tick = 0;
-    spell_power_mod.tick = 0;
-    dot_behavior = DOT_REFRESH;
-  }
-
-  virtual void init() override
-  {
-    hunter_ranged_attack_t::init();
-
-    update_flags = snapshot_flags = 0;
-    // Seems to be dinamically affected by Hunter's Mark
-    snapshot_flags |= STATE_TGT_MUL_TA;
-    update_flags   |= STATE_TGT_MUL_TA;
-  }
-
-  timespan_t calculate_dot_refresh_duration( const dot_t* dot, timespan_t triggered_duration ) const override
-  {
-    return dot->time_to_next_tick() + triggered_duration;
-  }
-};
 
 struct master_marksman_t : public residual_action::residual_periodic_action_t<hunter_ranged_attack_t>
 {
@@ -4918,27 +4882,12 @@ struct aspect_of_the_wild_t: public hunter_spell_t
     precast_time = clamp( precast_time, 0_ms, data().duration() );
   }
 
-  void schedule_execute( action_state_t* s ) override
-  {
-    // AotW buff is applied before the spell is cast, allowing it to
-    // reduce GCD of the action that triggered it.
-    if ( !precombat )
-    {
-      p()->buffs.aspect_of_the_wild->expire();
-      p()->buffs.aspect_of_the_wild->trigger();
-    }
-
-    hunter_spell_t::schedule_execute( s );
-  }
-
   void execute() override
   {
     hunter_spell_t::execute();
 
-    // Precombat actions skip schedule_execute, so the buff needs to be
-    // triggered here for precombat actions.
-    if ( precombat )
-      trigger_buff( p() -> buffs.aspect_of_the_wild, precast_time );
+    p() -> buffs.aspect_of_the_wild -> expire();
+    trigger_buff( p() -> buffs.aspect_of_the_wild, precast_time );
 
     p()->buffs.primal_instincts->expire();
     if ( trigger_buff( p() -> buffs.primal_instincts, precast_time ) )
@@ -6097,12 +6046,7 @@ void hunter_t::create_actions()
   player_t::create_actions();
 
   if ( talents.master_marksman.ok() )
-  {
-    if ( options.rolling_master_marksman )
-      actions.master_marksman = new attacks::master_marksman_t( this );
-    else
-      actions.master_marksman = new attacks::broken_master_marksman_t( this );
-  }
+    actions.master_marksman = new attacks::master_marksman_t( this );
 }
 
 void hunter_t::create_buffs()
@@ -6127,7 +6071,7 @@ void hunter_t::create_buffs()
       -> set_cooldown( 0_ms )
       -> set_activated( true )
       -> set_default_value_from_effect( 1 )
-      -> modify_default_value( conduits.one_with_the_beast.percent() );
+      -> apply_affecting_conduit( conduits.one_with_the_beast );
   if ( talents.spitting_cobra.ok() )
   {
     timespan_t duration = find_spell( 194407 ) -> duration();
@@ -6181,7 +6125,7 @@ void hunter_t::create_buffs()
   buffs.precise_shots =
     make_buff( this, "precise_shots", find_spell( 260242 ) )
       -> set_default_value_from_effect( 1 )
-      -> modify_default_value( conduits.powerful_precision.percent() );
+      -> apply_affecting_conduit( conduits.powerful_precision );
 
   buffs.steady_focus =
     make_buff( this, "steady_focus", find_spell( 193534 ) )
@@ -7453,7 +7397,6 @@ void hunter_t::create_options()
                             0_ms, 0.6_s ) );
   add_option( opt_float( "hunter.memory_of_lucid_dreams_proc_chance", options.memory_of_lucid_dreams_proc_chance,
                             0, 1 ) );
-  add_option( opt_bool( "hunter.rolling_master_marksman", options.rolling_master_marksman ) );
   add_option( opt_obsoleted( "hunter_fixed_time" ) );
 }
 
